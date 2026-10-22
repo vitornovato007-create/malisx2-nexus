@@ -1,0 +1,188 @@
+
+name: Build MaliSX2 Android ARM64
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    name: Compile MaliSX2 for Android ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      ANDROID_API: "29"
+      ANDROID_NDK_VERSION: "28.2.13676358"
+      MESA_COMMIT: "730a6284cb7a88f6c19a07f1caea35c7a2ae64f2"
+
+    steps:
+      - name: Download source code
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            llvm \
+            libclang-dev \
+            lld \
+            git \
+            curl \
+            pkg-config \
+            python3 \
+            python3-pip \
+            python3-venv \
+            python3-mako \
+            python3-yaml \
+            ninja-build \
+            cmake \
+            libssl-dev \
+            ca-certificates
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Meson and Python dependencies
+        run: |
+          python3 -m venv --system-site-packages .venv
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install "meson>=1.7,<2" mako pyyaml
+
+      - name: Install compatible bindgen
+        run: |
+          cargo install bindgen-cli \
+            --version 0.71.1 \
+            --locked
+          echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          bindgen --version
+
+      - name: Validate toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -d "$ANDROID_NDK_HOME"
+          test -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+          rustc --version
+          cargo --version
+          rustc --print target-list | grep -Fx aarch64-linux-android
+          meson --version
+          ninja --version
+          bindgen --version
+
+      - name: Fetch pinned Mesa source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --filter=blob:none \
+            https://github.com/bmdhacks/armsx2-turnip.git \
+            mesa
+
+          git -C mesa fetch --depth 1 origin "$MESA_COMMIT"
+          git -C mesa checkout --detach "$MESA_COMMIT"
+
+          test -d mesa/src/panfrost
+          test "$(git -C mesa rev-parse HEAD)" = "$MESA_COMMIT"
+
+      - name: Prepare Android cross compilation
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sed -i \
+            "s|/home/bmd/Android/Sdk/ndk/28.2.13676358|${ANDROID_NDK_HOME}|g" \
+            cross/android-aarch64.ini
+
+          grep -n "ndk =" cross/android-aarch64.ini
+
+          test -f cross/android-aarch64.ini
+          test -f meson.build
+          test -f mesa-glue/meson.build
+          test -f src/meson.build
+
+      - name: Configure MaliSX2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          meson setup build-android \
+            --cross-file cross/android-aarch64.ini \
+            --buildtype=release
+
+      - name: Compile MaliSX2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ninja -C build-android -v
+
+      - name: Verify and strip driver
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          DRIVER="build-android/src/libvulkan_malisx2.so"
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          READELF="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          test -s "$DRIVER"
+
+          mkdir -p dist
+          "$STRIP" -o dist/libvulkan_malisx2.so "$DRIVER"
+
+          "$READELF" -h dist/libvulkan_malisx2.so
+          file dist/libvulkan_malisx2.so
+          sha256sum dist/libvulkan_malisx2.so
+
+          test -s dist/libvulkan_malisx2.so
+
+      - name: Package experimental driver
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd dist
+          zip -9 malisx2-android-arm64-experimental.zip \
+            libvulkan_malisx2.so
+          cd ..
+          sha256sum dist/malisx2-android-arm64-experimental.zip
+
+      - name: Upload compiled driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaliSX2-Android-ARM64-experimental
+          path: |
+            dist/libvulkan_malisx2.so
+            dist/malisx2-android-arm64-experimental.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaliSX2-build-logs
+          path: |
+            build-android/meson-logs/
+            build-android/meson-info/
+          if-no-files-found: ignore
+          retention-days: 7
